@@ -98,11 +98,20 @@ async fn summarize_single_topic(
         }],
     };
 
-    let response = client
+    let mut req_builder = client
         .post(format!("{}/v1/messages", config.base_url))
-        .header("x-api-key", &config.api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+
+    if config.api_type == "bedrock-mantle" {
+        req_builder = req_builder
+            .header("Authorization", format!("Bearer {}", config.api_key));
+    } else {
+        req_builder = req_builder
+            .header("x-api-key", &config.api_key)
+            .header("anthropic-version", "2023-06-01");
+    }
+
+    let response = req_builder
         .json(&request)
         .send()
         .await

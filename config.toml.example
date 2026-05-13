@@ -1,12 +1,21 @@
 [discord]
-# User token (no "Bot " prefix) or bot token (with "Bot " prefix)
+# User token (raw) or bot token (prepend "Bot ")
+# Can also be set via DISCORD_TOKEN env var
 token = "your-discord-token"
 
 [llm]
-# API key for topic clustering and summary generation
-api_key = "your-api-key"
+# Option 1: Anthropic direct API
+# api_key = "sk-ant-..."
+# model = "claude-sonnet-4-20250514"
+# base_url = "https://api.anthropic.com"
+# api_type = "anthropic"
+
+# Option 2: Bedrock Mantle (uses AWS_BEARER_TOKEN_BEDROCK env var)
+# If AWS_BEARER_TOKEN_BEDROCK is set, it auto-switches to bedrock-mantle
+api_key = ""
 model = "claude-sonnet-4-20250514"
-base_url = "https://api.anthropic.com"
+base_url = "https://bedrock-mantle.us-west-2.api.aws"
+api_type = "bedrock-mantle"
 
 [[channels]]
 id = "channel-id-here"

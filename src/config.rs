@@ -23,6 +23,15 @@ pub struct LlmConfig {
     pub api_key: String,
     pub model: String,
     pub base_url: String,
+    /// API type: "anthropic" (default) or "bedrock-mantle"
+    /// bedrock-mantle uses the same Anthropic Messages format but
+    /// authenticates via AWS_BEARER_TOKEN_BEDROCK
+    #[serde(default = "default_api_type")]
+    pub api_type: String,
+}
+
+fn default_api_type() -> String {
+    "anthropic".to_string()
 }
 
 /// A single Discord channel to scrape
@@ -48,6 +57,12 @@ pub fn load_config(path: &Path) -> Result<Config> {
     }
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         config.llm.api_key = key;
+    }
+    if let Ok(key) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
+        config.llm.api_key = key;
+        if config.llm.api_type == "anthropic" {
+            config.llm.api_type = "bedrock-mantle".to_string();
+        }
     }
 
     Ok(config)
