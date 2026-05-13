@@ -33,9 +33,22 @@ pub struct ChannelConfig {
     pub guild_id: String,
 }
 
-/// Load and parse the config file from the given path
+/// Load and parse the config file from the given path.
+///
+/// Supports env var overrides:
+///   - DISCORD_TOKEN overrides discord.token
+///   - ANTHROPIC_API_KEY overrides llm.api_key
 pub fn load_config(path: &Path) -> Result<Config> {
     let content = std::fs::read_to_string(path)?;
-    let config: Config = toml::from_str(&content)?;
+    let mut config: Config = toml::from_str(&content)?;
+
+    // Env var overrides
+    if let Ok(token) = std::env::var("DISCORD_TOKEN") {
+        config.discord.token = token;
+    }
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        config.llm.api_key = key;
+    }
+
     Ok(config)
 }
