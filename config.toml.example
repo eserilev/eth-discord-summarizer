@@ -1,0 +1,14 @@
+[discord]
+# User token (no "Bot " prefix) or bot token (with "Bot " prefix)
+token = "your-discord-token"
+
+[llm]
+# API key for topic clustering and summary generation
+api_key = "your-api-key"
+model = "claude-sonnet-4-20250514"
+base_url = "https://api.anthropic.com"
+
+[[channels]]
+id = "channel-id-here"
+name = "consensus-specs"
+guild_id = "guild-id-here"
