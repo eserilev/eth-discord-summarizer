@@ -384,6 +384,16 @@ fn parse_match_response(text: &str, new_titles: &[String]) -> Result<Vec<TopicMa
         }
     }
 
+    // Deduplicate: if two titles got the same slug, append a suffix
+    let mut seen_slugs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for result in &mut results {
+        let count = seen_slugs.entry(result.slug.clone()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            result.slug = format!("{}-{}", result.slug, count);
+        }
+    }
+
     Ok(results)
 }
 
