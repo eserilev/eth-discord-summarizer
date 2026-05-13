@@ -3,6 +3,7 @@ mod config;
 mod discord;
 mod output;
 mod summary;
+mod topic_registry;
 
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
@@ -13,7 +14,8 @@ use tracing::info;
 /// Ethereum Discord Channel Summarizer
 ///
 /// Scrapes messages from configured Discord channels and generates
-/// daily Markdown summaries grouped by discussion topic.
+/// daily Markdown summaries grouped by discussion topic, with
+/// Obsidian-style linked notes and a cross-channel topic registry.
 #[derive(Parser, Debug)]
 #[command(name = "eth-discord-summarizer")]
 #[command(about = "Scrape Ethereum Discord channels and generate topic-grouped summaries")]
@@ -82,6 +84,9 @@ async fn main() -> Result<()> {
 
     info!("Scraping {} channel(s)", channels.len());
 
+    // Load the topic registry
+    let mut registry = topic_registry::load_registry(&cli.output)?;
+
     // Process each channel
     for channel in &channels {
         info!("Processing channel: {} ({})", channel.name, channel.id);
@@ -104,9 +109,50 @@ async fn main() -> Result<()> {
         // Generate summaries for each topic
         let summaries = summary::summarize_topics(&cfg.llm, &clusters).await?;
 
-        // Write output files
-        output::write_output(&cli.output, &channel.name, from_date, &clusters, &summaries)?;
+        // Extract topic titles from clusters
+        let titles: Vec<String> = clusters.iter().map(|c| c.title.clone()).collect();
+
+        // Match new titles against the registry via LLM
+        let matches = topic_registry::match_topics(&cfg.llm, &titles, &registry).await?;
+        info!("Matched {} topic(s) against registry", matches.len());
+
+        // Iterate over each date in the range for output
+        let mut current_date = from_date;
+        while current_date <= to_date {
+            // Write daily summary files (using matched slugs as filenames)
+            output::write_output(
+                &cli.output,
+                &channel.name,
+                current_date,
+                &clusters,
+                &summaries,
+                &matches,
+            )?;
+
+            // Update registry with new occurrences
+            topic_registry::update_registry(
+                &mut registry,
+                &matches,
+                &channel.name,
+                current_date,
+            );
+
+            current_date = current_date
+                .succ_opt()
+                .unwrap_or(current_date);
+
+            // If single date, break after first iteration
+            if from_date == to_date {
+                break;
+            }
+        }
     }
+
+    // Write/update topic MOC files
+    topic_registry::write_topic_files(&cli.output, &registry)?;
+
+    // Save the updated registry
+    topic_registry::save_registry(&cli.output, &registry)?;
 
     info!("Done!");
     Ok(())
