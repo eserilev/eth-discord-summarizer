@@ -412,6 +412,209 @@ fn extract_json(text: &str) -> &str {
 
 /// Deterministic slug generation from a title.
 ///
+/// A proposed merge: move all occurrences from source into target.
+#[derive(Debug, Clone)]
+pub struct TopicMerge {
+    pub source_slug: String,
+    pub target_slug: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeResponse {
+    merges: Vec<MergeEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MergeEntry {
+    source: String,
+    target: String,
+    reason: String,
+}
+
+/// Ask the LLM to identify topics in the registry that should be merged.
+///
+/// Returns a list of proposed merges (source → target).
+pub async fn find_merge_candidates(
+    config: &LlmConfig,
+    registry: &TopicRegistry,
+) -> Result<Vec<TopicMerge>> {
+    if registry.topics.len() < 2 {
+        return Ok(vec![]);
+    }
+
+    let client = Client::new();
+    let prompt = build_cleanup_prompt(registry);
+
+    let request = AnthropicRequest {
+        model: config.model.clone(),
+        max_tokens: 4096,
+        messages: vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: prompt,
+        }],
+    };
+
+    let mut req_builder = client
+        .post(format!("{}/v1/messages", config.base_url))
+        .header("content-type", "application/json");
+
+    if config.api_type == "bedrock-mantle" {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", config.api_key));
+    } else {
+        req_builder = req_builder
+            .header("x-api-key", &config.api_key)
+            .header("anthropic-version", "2023-06-01");
+    }
+
+    let response = req_builder
+        .json(&request)
+        .send()
+        .await
+        .context("Failed to call LLM API for cleanup")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("LLM API returned {} during cleanup: {}", status, body);
+    }
+
+    let api_response: AnthropicResponse = response.json().await
+        .context("Failed to parse LLM cleanup response")?;
+
+    let text = api_response
+        .content
+        .into_iter()
+        .filter_map(|block| block.text)
+        .collect::<Vec<_>>()
+        .join("");
+
+    parse_merge_response(&text)
+}
+
+fn build_cleanup_prompt(registry: &TopicRegistry) -> String {
+    let mut topic_list = String::new();
+    for entry in registry.topics.values() {
+        topic_list.push_str(&format!(
+            "- slug: \"{}\" | description: \"{}\" | occurrences: {}\n",
+            entry.slug,
+            entry.description,
+            entry.occurrences.len()
+        ));
+    }
+
+    format!(
+        r#"You are reviewing a topic registry from an Ethereum R&D Discord summarizer.
+
+Here are all the topics currently in the registry:
+
+{topic_list}
+
+Identify any topics that are duplicates or should be merged because they cover the same subject.
+For each proposed merge, pick the better slug as the "target" (prefer the one with more occurrences or a clearer name).
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{{
+  "merges": [
+    {{"source": "slug-to-remove", "target": "slug-to-keep", "reason": "brief explanation"}}
+  ]
+}}
+
+If no merges are needed, return: {{"merges": []}}
+
+Rules:
+- Only merge topics that are clearly about the same subject
+- Don't merge topics that are merely related but distinct
+- The target should be the more established/better-named topic"#
+    )
+}
+
+fn parse_merge_response(text: &str) -> Result<Vec<TopicMerge>> {
+    let json_str = extract_json(text);
+    let response: MergeResponse = serde_json::from_str(json_str)
+        .with_context(|| "Failed to parse merge JSON from LLM response")?;
+
+    Ok(response
+        .merges
+        .into_iter()
+        .map(|e| TopicMerge {
+            source_slug: e.source,
+            target_slug: e.target,
+            reason: e.reason,
+        })
+        .collect())
+}
+
+/// Apply a merge: move all occurrences from source topic into target topic,
+/// then remove the source. Also renames any output files.
+pub fn apply_merge(
+    registry: &mut TopicRegistry,
+    merge: &TopicMerge,
+    output_dir: &Path,
+) -> Result<()> {
+    // Get source occurrences
+    let source_occurrences = registry
+        .topics
+        .get(&merge.source_slug)
+        .map(|e| e.occurrences.clone())
+        .unwrap_or_default();
+
+    // Move occurrences to target
+    if let Some(target) = registry.topics.get_mut(&merge.target_slug) {
+        for mut occ in source_occurrences {
+            // Update the path to use the target slug
+            let old_path = occ.path.clone();
+            occ.path = occ.path.replace(&merge.source_slug, &merge.target_slug);
+
+            // Rename the actual file if it exists
+            let old_file = output_dir.join(format!("{}.md", old_path));
+            let new_file = output_dir.join(format!("{}.md", occ.path));
+            if old_file.exists() {
+                if let Some(parent) = new_file.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::rename(&old_file, &new_file)?;
+                debug!(
+                    "Renamed {} -> {}",
+                    old_file.display(),
+                    new_file.display()
+                );
+            }
+
+            // Add to target if not already present
+            let already_exists = target
+                .occurrences
+                .iter()
+                .any(|o| o.channel == occ.channel && o.date == occ.date);
+            if !already_exists {
+                target.occurrences.push(occ);
+            }
+        }
+    } else {
+        tracing::warn!(
+            "Merge target '{}' not found in registry, skipping",
+            merge.target_slug
+        );
+        return Ok(());
+    }
+
+    // Remove source topic
+    registry.topics.remove(&merge.source_slug);
+
+    // Remove source MOC file if it exists
+    let source_moc = output_dir.join("topics").join(format!("{}.md", merge.source_slug));
+    if source_moc.exists() {
+        std::fs::remove_file(&source_moc)?;
+        debug!("Removed MOC file {}", source_moc.display());
+    }
+
+    info!(
+        "Merged '{}' into '{}'",
+        merge.source_slug, merge.target_slug
+    );
+    Ok(())
+}
+
 /// - Lowercase everything
 /// - Replace spaces/special chars with hyphens
 /// - Remove filler words
