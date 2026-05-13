@@ -2,45 +2,50 @@
 
 ## File: `src/clustering.rs`
 
-## Status: Not yet implemented
+## Status: Implemented
 
 ## Approach: LLM-Assisted Topic Clustering
 
-Given a flat list of chronological messages from a single channel+day, use an LLM to identify distinct discussion topics and assign each message to a topic.
+Given a flat list of chronological messages from a single channel+day, uses the Anthropic API to identify distinct discussion topics and assign each message to exactly one topic.
 
-## Input
+## Pipeline
 
-A list of `DiscordMessage` objects (chronological, from one channel, one day).
+1. Format messages as a numbered list with: index, timestamp, author, reply references, content
+2. Send to LLM with structured prompt asking for JSON topic assignments
+3. Parse JSON response → `Vec<TopicAssignment>` (title + message indices)
+4. Build `TopicCluster` structs with messages grouped and sorted chronologically
 
-## Output
+## Batching
 
-```rust
-pub struct TopicCluster {
-    pub title: String,                // Short topic title (inferred by LLM)
-    pub messages: Vec<DiscordMessage>, // Messages belonging to this topic
-}
-```
+- `MAX_MESSAGES_PER_BATCH = 200`
+- If a channel has >200 messages in a day, chunk into batches and cluster each independently
+- TODO: merge topics with similar titles across batch boundaries
 
-## Strategy
+## LLM Prompt Design
 
-1. Format messages as a numbered list with timestamps, authors, content, and reply references
-2. Send to LLM with a prompt asking it to:
-   - Identify distinct discussion topics
-   - Assign each message (by number) to a topic
-   - Generate a short title for each topic
-3. Parse the LLM response to group messages into `TopicCluster`s
+The prompt:
+- Provides context ("Ethereum R&D Discord channel")
+- Shows messages as numbered list with reply chain references (e.g., `[replying to #5]`)
+- Asks for JSON output: `{ "topics": [{ "title": "...", "message_indices": [...] }] }`
+- Rules: every message assigned to exactly one topic, titles max 10 words, isolated messages go to "Miscellaneous"
 
-## LLM Prompt Design (TODO)
+## Response Parsing
 
-The prompt should:
-- Provide context: "These are messages from an Ethereum R&D Discord channel"
-- Ask for topic identification with clear boundaries
-- Handle the case where a single message could belong to multiple topics (assign to primary)
-- Handle noise (bot messages, reactions-only, off-topic) — group as "misc" or exclude
-- Return structured output (JSON) for reliable parsing
+- Strips markdown code fences if present (```json ... ```)
+- Finds first `{` to last `}` as JSON
+- Validates all indices are in range
+- Builds clusters with participants extracted and deduped
 
-## Considerations
+## API Integration
 
-- Token limits: for busy channels, may need to chunk messages and cluster in batches
-- Reply chains: include `message_reference` info so LLM can see conversation threading
-- Context: message type 19 = reply, which helps the LLM understand conversation flow
+Uses Anthropic Messages API:
+- Endpoint: `{base_url}/v1/messages`
+- Headers: `x-api-key`, `anthropic-version: 2023-06-01`
+- `max_tokens: 4096`
+- Model from config (default: claude-sonnet-4-20250514)
+
+## Error Handling
+
+- Non-2xx API responses: bail with status + body
+- Invalid JSON from LLM: bail with parse error
+- Out-of-range indices: bail with validation error
