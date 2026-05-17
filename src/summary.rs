@@ -1,11 +1,10 @@
-use anyhow::{Context, Result};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use anyhow::Result;
 use tracing::{debug, info};
 
 use crate::clustering::TopicCluster;
 use crate::config::LlmConfig;
 use crate::discord::DiscordMessage;
+use crate::llm;
 
 /// A summary for a single discussion topic
 #[derive(Debug, Clone)]
@@ -20,34 +19,7 @@ pub struct TopicSummary {
     pub messages: Vec<DiscordMessage>,
 }
 
-/// Anthropic API types (shared with clustering, but kept local for simplicity)
-#[derive(Debug, Serialize)]
-struct AnthropicRequest {
-    model: String,
-    max_tokens: u32,
-    messages: Vec<AnthropicMessage>,
-}
-
-#[derive(Debug, Serialize)]
-struct AnthropicMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicResponse {
-    content: Vec<ContentBlock>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ContentBlock {
-    text: Option<String>,
-}
-
 /// Generate summaries for each topic cluster using the LLM.
-///
-/// For each cluster, sends the messages to the LLM and asks for a concise
-/// summary capturing key points, decisions, and conclusions.
 pub async fn summarize_topics(
     config: &LlmConfig,
     clusters: &[TopicCluster],
@@ -58,26 +30,20 @@ pub async fn summarize_topics(
 
     info!(topic_count = clusters.len(), "Generating summaries");
 
-    let client = Client::new();
     let mut summaries = Vec::with_capacity(clusters.len());
 
     for cluster in clusters {
-        let summary = summarize_single_topic(config, &client, cluster).await?;
+        let summary = summarize_single_topic(config, cluster).await?;
         summaries.push(summary);
     }
 
-    info!(
-        summaries = summaries.len(),
-        "Summary generation complete"
-    );
-
+    info!(summaries = summaries.len(), "Summary generation complete");
     Ok(summaries)
 }
 
 /// Generate a summary for a single topic cluster.
 async fn summarize_single_topic(
     config: &LlmConfig,
-    client: &Client,
     cluster: &TopicCluster,
 ) -> Result<TopicSummary> {
     debug!(
@@ -89,49 +55,7 @@ async fn summarize_single_topic(
     let formatted = format_messages_for_summary(&cluster.messages);
     let prompt = build_summary_prompt(&cluster.title, &formatted);
 
-    let request = AnthropicRequest {
-        model: config.model.clone(),
-        max_tokens: 2048,
-        messages: vec![AnthropicMessage {
-            role: "user".to_string(),
-            content: prompt,
-        }],
-    };
-
-    let mut req_builder = client
-        .post(format!("{}/v1/messages", config.base_url))
-        .header("content-type", "application/json");
-
-    if config.api_type == "bedrock-mantle" {
-        req_builder = req_builder
-            .header("Authorization", format!("Bearer {}", config.api_key));
-    } else {
-        req_builder = req_builder
-            .header("x-api-key", &config.api_key)
-            .header("anthropic-version", "2023-06-01");
-    }
-
-    let response = req_builder
-        .json(&request)
-        .send()
-        .await
-        .context("Failed to call LLM API for summary")?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("LLM API returned {} during summarization: {}", status, body);
-    }
-
-    let api_response: AnthropicResponse = response.json().await
-        .context("Failed to parse LLM summary response")?;
-
-    let summary_text = api_response
-        .content
-        .into_iter()
-        .filter_map(|block| block.text)
-        .collect::<Vec<_>>()
-        .join("");
+    let summary_text = llm::complete(config, &prompt, 2048).await?;
 
     Ok(TopicSummary {
         title: cluster.title.clone(),

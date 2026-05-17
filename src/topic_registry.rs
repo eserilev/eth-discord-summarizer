@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::{debug, info};
 
 use crate::config::LlmConfig;
+use crate::llm;
 
 /// A match result for a single topic title
 #[derive(Debug, Clone)]
@@ -41,30 +41,6 @@ pub struct TopicOccurrence {
     pub channel: String,
     pub date: String,
     pub path: String,
-}
-
-/// Anthropic API types for LLM matching
-#[derive(Debug, Serialize)]
-struct AnthropicRequest {
-    model: String,
-    max_tokens: u32,
-    messages: Vec<AnthropicMessage>,
-}
-
-#[derive(Debug, Serialize)]
-struct AnthropicMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicResponse {
-    content: Vec<ContentBlock>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ContentBlock {
-    text: Option<String>,
 }
 
 /// LLM response schema for topic matching
@@ -155,53 +131,10 @@ pub async fn match_topics(
         "Matching topics against registry via LLM"
     );
 
-    let client = Client::new();
+
     let prompt = build_matching_prompt(new_titles, registry);
 
-    let request = AnthropicRequest {
-        model: config.model.clone(),
-        max_tokens: 4096,
-        messages: vec![AnthropicMessage {
-            role: "user".to_string(),
-            content: prompt,
-        }],
-    };
-
-    let mut req_builder = client
-        .post(format!("{}/v1/messages", config.base_url))
-        .header("content-type", "application/json");
-
-    if config.api_type == "bedrock-mantle" {
-        req_builder = req_builder.header("Authorization", format!("Bearer {}", config.api_key));
-    } else {
-        req_builder = req_builder
-            .header("x-api-key", &config.api_key)
-            .header("anthropic-version", "2023-06-01");
-    }
-
-    let response = req_builder
-        .json(&request)
-        .send()
-        .await
-        .context("Failed to call LLM API for topic matching")?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("LLM API returned {} during topic matching: {}", status, body);
-    }
-
-    let api_response: AnthropicResponse = response
-        .json()
-        .await
-        .context("Failed to parse LLM topic matching response")?;
-
-    let text = api_response
-        .content
-        .into_iter()
-        .filter_map(|block| block.text)
-        .collect::<Vec<_>>()
-        .join("");
+    let text = llm::complete(config, &prompt, 4096).await?;
 
     parse_match_response(&text, new_titles)
 }
@@ -443,51 +376,10 @@ pub async fn find_merge_candidates(
         return Ok(vec![]);
     }
 
-    let client = Client::new();
+
     let prompt = build_cleanup_prompt(registry);
 
-    let request = AnthropicRequest {
-        model: config.model.clone(),
-        max_tokens: 4096,
-        messages: vec![AnthropicMessage {
-            role: "user".to_string(),
-            content: prompt,
-        }],
-    };
-
-    let mut req_builder = client
-        .post(format!("{}/v1/messages", config.base_url))
-        .header("content-type", "application/json");
-
-    if config.api_type == "bedrock-mantle" {
-        req_builder = req_builder.header("Authorization", format!("Bearer {}", config.api_key));
-    } else {
-        req_builder = req_builder
-            .header("x-api-key", &config.api_key)
-            .header("anthropic-version", "2023-06-01");
-    }
-
-    let response = req_builder
-        .json(&request)
-        .send()
-        .await
-        .context("Failed to call LLM API for cleanup")?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("LLM API returned {} during cleanup: {}", status, body);
-    }
-
-    let api_response: AnthropicResponse = response.json().await
-        .context("Failed to parse LLM cleanup response")?;
-
-    let text = api_response
-        .content
-        .into_iter()
-        .filter_map(|block| block.text)
-        .collect::<Vec<_>>()
-        .join("");
+    let text = llm::complete(config, &prompt, 4096).await?;
 
     parse_merge_response(&text)
 }

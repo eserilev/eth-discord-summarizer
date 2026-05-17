@@ -2,6 +2,7 @@ mod archive;
 mod clustering;
 mod config;
 mod discord;
+mod llm;
 mod output;
 mod publish;
 mod summary;
@@ -287,10 +288,6 @@ async fn run_archive(
         let already_published = publish::published_dates(&pub_config, channel_name)
             .unwrap_or_default();
 
-        let mut effective_from = from_date;
-        let mut effective_to = to_date;
-
-        // Find the actual date range we need to process (skip already-done dates)
         let mut dates_to_process: Vec<chrono::NaiveDate> = Vec::new();
         let mut d = from_date;
         while d <= to_date {
@@ -316,51 +313,38 @@ async fn run_archive(
             );
         }
 
-        // Fetch messages only for dates we haven't processed
-        effective_from = *dates_to_process.first().unwrap();
-        effective_to = *dates_to_process.last().unwrap();
+        // Process each date individually
+        for &date in &dates_to_process {
+            let messages =
+                archive::fetch_archived_messages(&source, channel_name, date, date).await?;
 
-        let messages =
-            archive::fetch_archived_messages(&source, channel_name, effective_from, effective_to).await?;
-
-        if messages.is_empty() {
-            info!("No messages found for {} on this date range", channel_name);
-            continue;
-        }
-
-        info!("Read {} messages from {}", messages.len(), channel_name);
-
-        let clusters = clustering::cluster_messages(&cfg.llm, &messages).await?;
-        info!("Identified {} topic(s)", clusters.len());
-
-        let summaries = summary::summarize_topics(&cfg.llm, &clusters).await?;
-
-        let titles: Vec<String> = clusters.iter().map(|c| c.title.clone()).collect();
-        let matches = topic_registry::match_topics(&cfg.llm, &titles, &registry).await?;
-        info!("Matched {} topic(s) against registry", matches.len());
-
-        if dry_run {
-            info!("--- DRY RUN RESULTS for {} ---", channel_name);
-            for (i, m) in matches.iter().enumerate() {
-                let status = if m.is_new { "NEW" } else { "EXISTING" };
-                info!(
-                    "  [{}] {} → slug: \"{}\" ({})",
-                    i + 1,
-                    m.original_title,
-                    m.slug,
-                    status
-                );
+            if messages.is_empty() {
+                debug!("No messages for {} on {}", channel_name, date);
+                continue;
             }
-            continue;
-        }
 
-        // Write output
-        let mut current_date = from_date;
-        while current_date <= to_date {
+            info!("[{}/{}] {} messages", channel_name, date, messages.len());
+
+            let clusters = clustering::cluster_messages(&cfg.llm, &messages).await?;
+            info!("  → {} topic(s)", clusters.len());
+
+            let summaries = summary::summarize_topics(&cfg.llm, &clusters).await?;
+
+            let titles: Vec<String> = clusters.iter().map(|c| c.title.clone()).collect();
+            let matches = topic_registry::match_topics(&cfg.llm, &titles, &registry).await?;
+
+            if dry_run {
+                for (i, m) in matches.iter().enumerate() {
+                    let status = if m.is_new { "NEW" } else { "EXISTING" };
+                    info!("    [{}] {} → \"{}\" ({})", i + 1, m.original_title, m.slug, status);
+                }
+                continue;
+            }
+
             output::write_output(
                 output_dir,
                 channel_name,
-                current_date,
+                date,
                 &clusters,
                 &summaries,
                 &matches,
@@ -370,13 +354,8 @@ async fn run_archive(
                 &mut registry,
                 &matches,
                 channel_name,
-                current_date,
+                date,
             );
-
-            current_date = current_date.succ_opt().unwrap_or(current_date);
-            if from_date == to_date {
-                break;
-            }
         }
     }
 

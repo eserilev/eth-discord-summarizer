@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tracing::{debug, info};
 
 use crate::config::LlmConfig;
 use crate::discord::DiscordMessage;
+use crate::llm;
 
 /// A cluster of messages belonging to a single discussion topic
 #[derive(Debug, Clone)]
@@ -28,30 +28,6 @@ struct TopicAssignment {
     title: String,
     /// Message indices (0-based) belonging to this topic
     message_indices: Vec<usize>,
-}
-
-/// Anthropic API request/response types
-#[derive(Debug, Serialize)]
-struct AnthropicRequest {
-    model: String,
-    max_tokens: u32,
-    messages: Vec<AnthropicMessage>,
-}
-
-#[derive(Debug, Serialize)]
-struct AnthropicMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AnthropicResponse {
-    content: Vec<ContentBlock>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ContentBlock {
-    text: Option<String>,
 }
 
 /// Maximum messages to send in a single clustering request.
@@ -92,7 +68,6 @@ pub async fn cluster_messages(
             offset += chunk.len();
         }
 
-        // TODO: merge topics with similar titles across batches
         all_assignments
     };
 
@@ -108,8 +83,6 @@ async fn call_clustering_llm(
     config: &LlmConfig,
     messages: &[DiscordMessage],
 ) -> Result<Vec<TopicAssignment>> {
-    let client = Client::new();
-
     let formatted_messages = format_messages_for_prompt(messages);
     let prompt = build_clustering_prompt(&formatted_messages);
 
@@ -119,49 +92,7 @@ async fn call_clustering_llm(
         "Sending clustering request to LLM"
     );
 
-    let request = AnthropicRequest {
-        model: config.model.clone(),
-        max_tokens: 4096,
-        messages: vec![AnthropicMessage {
-            role: "user".to_string(),
-            content: prompt,
-        }],
-    };
-
-    let mut req_builder = client
-        .post(format!("{}/v1/messages", config.base_url))
-        .header("content-type", "application/json");
-
-    if config.api_type == "bedrock-mantle" {
-        req_builder = req_builder
-            .header("Authorization", format!("Bearer {}", config.api_key));
-    } else {
-        req_builder = req_builder
-            .header("x-api-key", &config.api_key)
-            .header("anthropic-version", "2023-06-01");
-    }
-
-    let response = req_builder
-        .json(&request)
-        .send()
-        .await
-        .context("Failed to call LLM API")?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("LLM API returned {}: {}", status, body);
-    }
-
-    let api_response: AnthropicResponse = response.json().await
-        .context("Failed to parse LLM response")?;
-
-    let text = api_response
-        .content
-        .into_iter()
-        .filter_map(|block| block.text)
-        .collect::<Vec<_>>()
-        .join("");
+    let text = llm::complete(config, &prompt, 4096).await?;
 
     parse_clustering_response(&text, messages.len())
 }
@@ -176,7 +107,6 @@ fn format_messages_for_prompt(messages: &[DiscordMessage]) -> String {
 
         let reply_info = if let Some(ref reference) = msg.message_reference {
             if let Some(ref msg_id) = reference.message_id {
-                // Find the index of the referenced message
                 let ref_idx = messages.iter().position(|m| m.id == *msg_id);
                 match ref_idx {
                     Some(idx) => format!(" [replying to #{}]", idx),
@@ -241,44 +171,31 @@ fn parse_clustering_response(
     text: &str,
     total_messages: usize,
 ) -> Result<Vec<TopicAssignment>> {
-    // Try to extract JSON from the response (handle potential markdown wrapping)
     let json_str = extract_json(text);
 
-    let response: ClusteringResponse = serde_json::from_str(json_str)
+    let mut response: ClusteringResponse = serde_json::from_str(json_str)
         .context("Failed to parse clustering JSON from LLM response")?;
 
-    // Validate: check all indices are in range
-    for topic in &response.topics {
-        for &idx in &topic.message_indices {
-            if idx >= total_messages {
-                anyhow::bail!(
-                    "LLM returned invalid message index {} (max {})",
-                    idx,
-                    total_messages - 1
-                );
-            }
-        }
+    // Filter out any invalid indices (LLM sometimes returns out-of-range)
+    for topic in &mut response.topics {
+        topic.message_indices.retain(|&idx| idx < total_messages);
     }
 
-    debug!(
-        topics = response.topics.len(),
-        "Parsed clustering response"
-    );
+    // Remove empty topics after filtering
+    response.topics.retain(|t| !t.message_indices.is_empty());
 
+    debug!(topics = response.topics.len(), "Parsed clustering response");
     Ok(response.topics)
 }
 
 /// Extract JSON from text that might be wrapped in markdown code fences.
 fn extract_json(text: &str) -> &str {
     let trimmed = text.trim();
-
-    // Strip ```json ... ``` wrapper if present
     if let Some(start) = trimmed.find('{') {
         if let Some(end) = trimmed.rfind('}') {
             return &trimmed[start..=end];
         }
     }
-
     trimmed
 }
 
@@ -296,10 +213,8 @@ fn build_clusters(
             .filter_map(|&idx| messages.get(idx).cloned())
             .collect();
 
-        // Ensure chronological order
         topic_messages.sort_by(|a, b| a.id.cmp(&b.id));
 
-        // Extract unique participants
         let mut participants: Vec<String> = topic_messages
             .iter()
             .map(|m| {
